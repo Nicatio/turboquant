@@ -60,13 +60,28 @@ class MlxTurboQuantMSE:
             dtype=dtype,
         )
 
+    def rotate(self, values: mx.array) -> mx.array:
+        original_shape = values.shape
+        flattened = mx.reshape(values.astype(self.dtype), (-1, self.dimension))
+        rotated = mx.matmul(flattened, self.rotation_transpose)
+        return mx.reshape(rotated, original_shape)
+
+    def unrotate(self, values: mx.array) -> mx.array:
+        original_shape = values.shape
+        flattened = mx.reshape(values.astype(self.dtype), (-1, self.dimension))
+        reconstructed = mx.matmul(flattened, self.rotation)
+        return mx.reshape(reconstructed, original_shape)
+
+    def lookup_centroids(self, indices: mx.array) -> mx.array:
+        return mx.take(self.centroids, indices.astype(mx.uint32), axis=0)
+
     def quantize_indices(self, values: mx.array) -> mx.array:
-        rotated = mx.matmul(values.astype(self.dtype), self.rotation_transpose)
+        rotated = self.rotate(values)
         if self.thresholds.shape[0] == 0:
             return mx.zeros(rotated.shape, dtype=mx.uint8)
         comparisons = mx.expand_dims(rotated, axis=-1) > self.thresholds
         return mx.sum(comparisons.astype(mx.uint8), axis=-1).astype(mx.uint8)
 
     def dequantize_indices(self, indices: mx.array) -> mx.array:
-        rotated_reconstruction = mx.take(self.centroids, indices, axis=0)
-        return mx.matmul(rotated_reconstruction, self.rotation)
+        rotated_reconstruction = self.lookup_centroids(indices)
+        return self.unrotate(rotated_reconstruction)

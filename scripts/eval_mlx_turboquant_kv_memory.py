@@ -8,7 +8,8 @@ import numpy as np
 from mlx_lm import load
 
 from turboquant.hf_cache import resolve_cached_model_path
-from turboquant.kv_cache import TurboQuantKVCache
+from turboquant.kv_cache import TurboQuantDirectKVCache, TurboQuantKVCache
+from turboquant.mlx_attention import enable_turboquant_direct_attention, get_transformer_layers
 
 
 DEFAULT_PROMPT = "Vector quantization can compress representations while preserving useful geometry."
@@ -65,15 +66,23 @@ def main() -> None:
     )
     parser.add_argument("--bits", type=int, default=3, help="TurboQuant bit-width.")
     parser.add_argument(
+        "--implementation",
+        choices=["direct", "shadow"],
+        default="direct",
+        help="TurboQuant cache implementation to test.",
+    )
+    parser.add_argument(
         "--dense-shadow",
         action="store_true",
-        help="Keep a decoded MLX shadow cache for speed at the cost of higher runtime memory.",
+        help="Keep a decoded MLX shadow cache for speed at the cost of higher runtime memory. Only used for shadow mode.",
     )
+    parser.add_argument("--block-size", type=int, default=256, help="Direct-cache block size.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     resolved_model = resolve_cached_model_path(args.model)
     model, tokenizer = load(resolved_model)
+    enable_turboquant_direct_attention(model)
 
     prompt_text = build_prompt_text(args.prompt, args.repeat)
     prompt_tokens = tokenizer.encode(prompt_text)
@@ -87,15 +96,27 @@ def main() -> None:
     gc.collect()
     mx.clear_cache()
 
-    turbo_cache = [
-        TurboQuantKVCache(
-            bits=args.bits,
-            seed=args.seed + i,
-            compute_stats=True,
-            use_dense_shadow=args.dense_shadow,
-        )
-        for i, _ in enumerate(model.layers)
-    ]
+    layers = list(get_transformer_layers(model))
+    if args.implementation == "direct":
+        turbo_cache = [
+            TurboQuantDirectKVCache(
+                bits=args.bits,
+                seed=args.seed + i,
+                compute_stats=True,
+                block_size=args.block_size,
+            )
+            for i, _ in enumerate(layers)
+        ]
+    else:
+        turbo_cache = [
+            TurboQuantKVCache(
+                bits=args.bits,
+                seed=args.seed + i,
+                compute_stats=True,
+                use_dense_shadow=args.dense_shadow,
+            )
+            for i, _ in enumerate(layers)
+        ]
     turbo_logits, turbo_stats = run_prefill(model, input_ids, turbo_cache)
     turbo_last = turbo_logits[0, -1, :]
 
@@ -110,11 +131,14 @@ def main() -> None:
     print(f"model={args.model}")
     print(f"resolved_model={resolved_model}")
     print(f"bits={args.bits}")
+    print(f"implementation={args.implementation}")
     print(f"dense_shadow={int(args.dense_shadow)}")
+    print(f"block_size={args.block_size}")
     print(f"prompt_tokens={len(prompt_tokens)}")
     print(f"baseline_cache_storage_gb={baseline_stats['cache_storage_gb']:.6f}")
     print(f"turboquant_cache_storage_gb={turbo_stats['cache_storage_gb']:.6f}")
     print(f"turboquant_dense_shadow_gb={bytes_to_gb(sum(c.dense_nbytes for c in turbo_cache)):.6f}")
+    print(f"turboquant_index_shadow_gb={bytes_to_gb(sum(getattr(c, 'index_shadow_nbytes', 0) for c in turbo_cache)):.6f}")
     print(f"storage_compression_ratio={baseline_stats['cache_storage_gb'] / max(turbo_stats['cache_storage_gb'], 1e-12):.4f}")
     print(f"baseline_peak_memory_gb={baseline_stats['peak_memory_gb']:.6f}")
     print(f"turboquant_peak_memory_gb={turbo_stats['peak_memory_gb']:.6f}")

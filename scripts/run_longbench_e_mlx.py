@@ -21,7 +21,8 @@ from turboquant.benchmark_utils import (
     matches_integer,
 )
 from turboquant.hf_cache import resolve_cached_model_path
-from turboquant.kv_cache import TurboQuantKVCache
+from turboquant.kv_cache import TurboQuantDirectKVCache, TurboQuantKVCache
+from turboquant.mlx_attention import enable_turboquant_direct_attention, get_transformer_layers
 
 
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
@@ -34,10 +35,16 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-def make_turbo_cache(model, bits: int, seed: int):
+def make_turbo_cache(model, bits: int, seed: int, implementation: str, block_size: int):
+    layers = list(get_transformer_layers(model))
+    if implementation == "direct":
+        return [
+            TurboQuantDirectKVCache(bits=bits, seed=seed + i, block_size=block_size)
+            for i, _ in enumerate(layers)
+        ]
     return [
         TurboQuantKVCache(bits=bits, seed=seed + i, use_dense_shadow=True)
-        for i, _ in enumerate(model.layers)
+        for i, _ in enumerate(layers)
     ]
 
 
@@ -110,6 +117,13 @@ def main() -> None:
     )
     parser.add_argument("--tasks", nargs="+", default=DEFAULT_TASKS)
     parser.add_argument("--bits", type=int, default=3)
+    parser.add_argument(
+        "--implementation",
+        choices=["direct", "shadow"],
+        default="direct",
+        help="TurboQuant cache implementation to benchmark.",
+    )
+    parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--max-samples", type=int, default=5)
     parser.add_argument("--max-prompt-tokens", type=int, default=8192)
     parser.add_argument("--max-tokens", type=int, default=32)
@@ -118,11 +132,14 @@ def main() -> None:
 
     resolved_model = resolve_cached_model_path(args.model)
     model, tokenizer = load(resolved_model)
+    enable_turboquant_direct_attention(model)
 
     print(f"model={args.model}")
     print(f"resolved_model={resolved_model}")
     print(f"data_dir={args.data_dir}")
     print(f"bits={args.bits}")
+    print(f"implementation={args.implementation}")
+    print(f"block_size={args.block_size}")
 
     for task in args.tasks:
         jsonl_path = task_file(args.data_dir, task)
@@ -170,7 +187,13 @@ def main() -> None:
             gc.collect()
             mx.clear_cache()
 
-            turbo_cache = make_turbo_cache(model, bits=args.bits, seed=args.seed)
+            turbo_cache = make_turbo_cache(
+                model,
+                bits=args.bits,
+                seed=args.seed,
+                implementation=args.implementation,
+                block_size=args.block_size,
+            )
             turbo_text, turbo_stats = run_generation(
                 model=model,
                 tokenizer=tokenizer,
