@@ -64,6 +64,11 @@ def main() -> None:
         help="Repeat the prompt text to build a longer context.",
     )
     parser.add_argument("--bits", type=int, default=3, help="TurboQuant bit-width.")
+    parser.add_argument(
+        "--dense-shadow",
+        action="store_true",
+        help="Keep a decoded MLX shadow cache for speed at the cost of higher runtime memory.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -82,7 +87,15 @@ def main() -> None:
     gc.collect()
     mx.clear_cache()
 
-    turbo_cache = [TurboQuantKVCache(bits=args.bits, seed=args.seed + i) for i, _ in enumerate(model.layers)]
+    turbo_cache = [
+        TurboQuantKVCache(
+            bits=args.bits,
+            seed=args.seed + i,
+            compute_stats=True,
+            use_dense_shadow=args.dense_shadow,
+        )
+        for i, _ in enumerate(model.layers)
+    ]
     turbo_logits, turbo_stats = run_prefill(model, input_ids, turbo_cache)
     turbo_last = turbo_logits[0, -1, :]
 
@@ -97,9 +110,11 @@ def main() -> None:
     print(f"model={args.model}")
     print(f"resolved_model={resolved_model}")
     print(f"bits={args.bits}")
+    print(f"dense_shadow={int(args.dense_shadow)}")
     print(f"prompt_tokens={len(prompt_tokens)}")
     print(f"baseline_cache_storage_gb={baseline_stats['cache_storage_gb']:.6f}")
     print(f"turboquant_cache_storage_gb={turbo_stats['cache_storage_gb']:.6f}")
+    print(f"turboquant_dense_shadow_gb={bytes_to_gb(sum(c.dense_nbytes for c in turbo_cache)):.6f}")
     print(f"storage_compression_ratio={baseline_stats['cache_storage_gb'] / max(turbo_stats['cache_storage_gb'], 1e-12):.4f}")
     print(f"baseline_peak_memory_gb={baseline_stats['peak_memory_gb']:.6f}")
     print(f"turboquant_peak_memory_gb={turbo_stats['peak_memory_gb']:.6f}")

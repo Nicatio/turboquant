@@ -7,33 +7,15 @@ import mlx.core as mx
 import numpy as np
 
 from turboquant.mse_quantizer import TurboQuantMSE
-
-
-def _pack_indices(indices: np.ndarray, bits: int) -> np.ndarray:
-    values = np.asarray(indices, dtype=np.uint32).reshape(-1)
-    if values.size == 0:
-        return np.zeros(0, dtype=np.uint8)
-    bit_planes = ((values[:, None] >> np.arange(bits, dtype=np.uint32)) & 1).astype(np.uint8)
-    return np.packbits(bit_planes.reshape(-1), bitorder="little")
-
-
-def _unpack_indices(packed: np.ndarray, bits: int, shape: Tuple[int, ...]) -> np.ndarray:
-    total_values = int(np.prod(shape))
-    if total_values == 0:
-        return np.zeros(shape, dtype=np.int64)
-    unpacked = np.unpackbits(np.asarray(packed, dtype=np.uint8), bitorder="little")
-    unpacked = unpacked[: total_values * bits].reshape(total_values, bits)
-    weights = (1 << np.arange(bits, dtype=np.uint32))[None, :]
-    values = np.sum(unpacked.astype(np.uint32) * weights, axis=1, dtype=np.uint32)
-    return values.reshape(shape).astype(np.int64)
+from turboquant.mlx_quantizer import MlxTurboQuantMSE, PackedIndexCodec
 
 
 @dataclass
 class _EncodedChunk:
-    packed_indices: np.ndarray
-    norms: np.ndarray
+    packed_indices: mx.array
+    norms: mx.array
     shape: Tuple[int, ...]
-    original_dtype: np.dtype
+    original_dtype: object
 
     @property
     def storage_nbytes(self) -> int:
@@ -41,17 +23,31 @@ class _EncodedChunk:
 
 
 class TurboQuantKVCache:
-    def __init__(self, bits: int, seed: int = 0, norm_dtype: np.dtype = np.float16):
+    step = 256
+
+    def __init__(
+        self,
+        bits: int,
+        seed: int = 0,
+        norm_dtype: object = mx.float16,
+        compute_stats: bool = False,
+        use_dense_shadow: bool = False,
+    ):
         if bits < 1:
             raise ValueError("bits must be at least 1.")
         self.turbo_bits = bits
         self.seed = seed
         self.norm_dtype = norm_dtype
+        self.compute_stats = compute_stats
+        self.use_dense_shadow = use_dense_shadow
         self.offset = 0
 
         self._key_chunks: List[_EncodedChunk] = []
         self._value_chunks: List[_EncodedChunk] = []
-        self._quantizers: Dict[int, TurboQuantMSE] = {}
+        self._quantizers: Dict[int, Tuple[TurboQuantMSE, MlxTurboQuantMSE]] = {}
+        self._codec = PackedIndexCodec(bits=bits)
+        self._dense_keys = None
+        self._dense_values = None
         self._reconstruction_stats = {
             "key_sq_error_sum": 0.0,
             "value_sq_error_sum": 0.0,
@@ -61,10 +57,22 @@ class TurboQuantKVCache:
             "value_vector_count": 0,
         }
 
-    def _get_quantizer(self, dimension: int) -> TurboQuantMSE:
-        quantizer = self._quantizers.get(dimension)
-        if quantizer is None:
-            quantizer = TurboQuantMSE(
+    def _reset_chunks(self) -> None:
+        self.offset = 0
+        self._key_chunks = []
+        self._value_chunks = []
+        self._dense_keys = None
+        self._dense_values = None
+
+    def _decode_all_chunks(self, chunks: List[_EncodedChunk]) -> mx.array:
+        if not chunks:
+            return mx.zeros((0,), dtype=mx.float32)
+        return mx.concatenate([self._decode_chunk(chunk) for chunk in chunks], axis=2)
+
+    def _get_quantizer(self, dimension: int) -> Tuple[TurboQuantMSE, MlxTurboQuantMSE]:
+        quantizers = self._quantizers.get(dimension)
+        if quantizers is None:
+            numpy_quantizer = TurboQuantMSE(
                 dimension=dimension,
                 bits=self.turbo_bits,
                 seed=self.seed + dimension,
@@ -72,85 +80,101 @@ class TurboQuantKVCache:
                 max_iter=96,
                 require_unit_norm=True,
             )
-            self._quantizers[dimension] = quantizer
-        return quantizer
-
-    def _encode_chunk(self, values: np.ndarray) -> Tuple[_EncodedChunk, np.ndarray]:
-        original_dtype = values.dtype
-        vectors = np.asarray(values, dtype=np.float64)
-        dimension = vectors.shape[-1]
-        flattened = vectors.reshape(-1, dimension)
-
-        norms = np.linalg.norm(flattened, axis=1, keepdims=True)
-        safe_norms = np.maximum(norms, 1e-12)
-        unit_vectors = np.zeros_like(flattened)
-        nonzero = norms[:, 0] > 1e-12
-        if np.any(nonzero):
-            unit_vectors[nonzero] = flattened[nonzero] / safe_norms[nonzero]
-            unit_vectors[nonzero] /= np.maximum(
-                np.linalg.norm(unit_vectors[nonzero], axis=1, keepdims=True),
-                1e-12,
+            quantizers = (
+                numpy_quantizer,
+                MlxTurboQuantMSE(numpy_quantizer),
             )
+            self._quantizers[dimension] = quantizers
+        return quantizers
 
-        quantizer = self._get_quantizer(dimension)
-        indices = np.zeros(flattened.shape, dtype=np.int64)
-        reconstructed_unit = np.zeros_like(flattened)
-        if np.any(nonzero):
-            quantized_indices = quantizer.quantize_indices(unit_vectors[nonzero])
-            indices[nonzero] = quantized_indices.astype(np.int64, copy=False)
-            reconstructed_unit[nonzero] = quantizer.dequantize_indices(quantized_indices)
+    def _encode_chunk(self, values: mx.array) -> Tuple[_EncodedChunk, mx.array]:
+        original_dtype = values.dtype
+        dimension = values.shape[-1]
+        flattened = mx.reshape(values.astype(mx.float32), (-1, dimension))
 
+        norms = mx.sqrt(mx.maximum(mx.sum(flattened * flattened, axis=1, keepdims=True), 1e-12))
+        safe_norms = mx.maximum(norms, 1e-12)
+        unit_vectors = flattened / safe_norms
+
+        _, mlx_quantizer = self._get_quantizer(dimension)
+        indices = mlx_quantizer.quantize_indices(unit_vectors)
+        reconstructed_unit = mlx_quantizer.dequantize_indices(indices)
         reconstructed = reconstructed_unit * norms
         encoded = _EncodedChunk(
-            packed_indices=_pack_indices(indices, self.turbo_bits),
-            norms=norms.astype(self.norm_dtype, copy=False),
+            packed_indices=self._codec.pack(indices),
+            norms=norms.astype(self.norm_dtype),
             shape=tuple(values.shape),
             original_dtype=original_dtype,
         )
-        return encoded, reconstructed.reshape(values.shape)
+        return encoded, mx.reshape(reconstructed, values.shape).astype(original_dtype)
 
-    def _decode_chunk(self, encoded: _EncodedChunk) -> np.ndarray:
+    def _decode_chunk(self, encoded: _EncodedChunk) -> mx.array:
         shape = encoded.shape
         dimension = shape[-1]
-        quantizer = self._get_quantizer(dimension)
-        indices = _unpack_indices(encoded.packed_indices, self.turbo_bits, shape)
-        reconstructed_unit = quantizer.dequantize_indices(indices.reshape(-1, dimension))
-        norms = encoded.norms.astype(np.float64, copy=False)
+        _, mlx_quantizer = self._get_quantizer(dimension)
+        indices = self._codec.unpack(encoded.packed_indices, shape)
+        reconstructed_unit = mlx_quantizer.dequantize_indices(mx.reshape(indices, (-1, dimension)))
+        norms = encoded.norms.astype(mx.float32)
         reconstructed = reconstructed_unit * norms
-        return reconstructed.reshape(shape).astype(encoded.original_dtype, copy=False)
+        return mx.reshape(reconstructed, shape).astype(encoded.original_dtype)
 
-    def _append_stats(self, original: np.ndarray, reconstructed: np.ndarray, kind: str) -> None:
-        flat_orig = np.asarray(original, dtype=np.float64).reshape(-1, original.shape[-1])
-        flat_recon = np.asarray(reconstructed, dtype=np.float64).reshape(-1, reconstructed.shape[-1])
-        sq_errors = np.sum((flat_orig - flat_recon) ** 2, axis=1)
-        orig_norms = np.linalg.norm(flat_orig, axis=1)
-        recon_norms = np.linalg.norm(flat_recon, axis=1)
-        denom = np.maximum(orig_norms * recon_norms, 1e-12)
-        cosines = np.sum(flat_orig * flat_recon, axis=1) / denom
+    def _append_stats(self, original: mx.array, reconstructed: mx.array, kind: str) -> None:
+        if not self.compute_stats:
+            return
+        flat_orig = mx.reshape(original.astype(mx.float32), (-1, original.shape[-1]))
+        flat_recon = mx.reshape(reconstructed.astype(mx.float32), (-1, reconstructed.shape[-1]))
+        sq_errors = mx.sum((flat_orig - flat_recon) ** 2, axis=1)
+        orig_norms = mx.sqrt(mx.maximum(mx.sum(flat_orig * flat_orig, axis=1), 1e-12))
+        recon_norms = mx.sqrt(mx.maximum(mx.sum(flat_recon * flat_recon, axis=1), 1e-12))
+        denom = mx.maximum(orig_norms * recon_norms, 1e-12)
+        cosines = mx.sum(flat_orig * flat_recon, axis=1) / denom
 
-        self._reconstruction_stats[f"{kind}_sq_error_sum"] += float(np.sum(sq_errors))
-        self._reconstruction_stats[f"{kind}_cosine_sum"] += float(np.sum(cosines))
+        self._reconstruction_stats[f"{kind}_sq_error_sum"] += float(mx.sum(sq_errors))
+        self._reconstruction_stats[f"{kind}_cosine_sum"] += float(mx.sum(cosines))
         self._reconstruction_stats[f"{kind}_vector_count"] += int(flat_orig.shape[0])
 
-    def update_and_fetch(self, keys, values):
-        key_np = np.asarray(keys)
-        value_np = np.asarray(values)
+    def _ensure_dense_capacity(self, prev: int, keys: mx.array, values: mx.array) -> None:
+        if self._dense_keys is None or (prev + keys.shape[2]) > self._dense_keys.shape[2]:
+            B, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
+            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            new_v = mx.zeros(v_shape, values.dtype)
+            if self._dense_keys is not None:
+                if prev % self.step != 0:
+                    self._dense_keys = self._dense_keys[..., :prev, :]
+                    self._dense_values = self._dense_values[..., :prev, :]
+                self._dense_keys = mx.concatenate([self._dense_keys, new_k], axis=2)
+                self._dense_values = mx.concatenate([self._dense_values, new_v], axis=2)
+            else:
+                self._dense_keys, self._dense_values = new_k, new_v
 
-        encoded_keys, reconstructed_keys = self._encode_chunk(key_np)
-        encoded_values, reconstructed_values = self._encode_chunk(value_np)
+    def update_and_fetch(self, keys, values):
+        encoded_keys, reconstructed_keys = self._encode_chunk(keys)
+        encoded_values, reconstructed_values = self._encode_chunk(values)
 
         self._key_chunks.append(encoded_keys)
         self._value_chunks.append(encoded_values)
-        self.offset += key_np.shape[2]
+        prev = self.offset
+        self.offset += keys.shape[2]
 
-        self._append_stats(key_np, reconstructed_keys, "key")
-        self._append_stats(value_np, reconstructed_values, "value")
+        self._append_stats(keys, reconstructed_keys, "key")
+        self._append_stats(values, reconstructed_values, "value")
 
-        all_keys = np.concatenate([self._decode_chunk(chunk) for chunk in self._key_chunks], axis=2)
-        all_values = np.concatenate([self._decode_chunk(chunk) for chunk in self._value_chunks], axis=2)
+        if self.use_dense_shadow:
+            self._ensure_dense_capacity(prev, keys, values)
+            self._dense_keys[..., prev : self.offset, :] = reconstructed_keys
+            self._dense_values[..., prev : self.offset, :] = reconstructed_values
+            return (
+                self._dense_keys[..., : self.offset, :],
+                self._dense_values[..., : self.offset, :],
+            )
+
         return (
-            mx.array(all_keys.astype(key_np.dtype, copy=False)),
-            mx.array(all_values.astype(value_np.dtype, copy=False)),
+            self._decode_all_chunks(self._key_chunks),
+            self._decode_all_chunks(self._value_chunks),
         )
 
     def size(self):
@@ -162,16 +186,51 @@ class TurboQuantKVCache:
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
     def empty(self):
-        return len(self._key_chunks) == 0
+        return self.offset == 0
+
+    @property
+    def state(self):
+        if self.use_dense_shadow and self._dense_keys is not None:
+            return (
+                self._dense_keys[..., : self.offset, :],
+                self._dense_values[..., : self.offset, :],
+            )
+        return (
+            self._decode_all_chunks(self._key_chunks),
+            self._decode_all_chunks(self._value_chunks),
+        )
+
+    @state.setter
+    def state(self, value) -> None:
+        keys, values = value
+        self._reset_chunks()
+        if keys is None or values is None:
+            return
+
+        encoded_keys, reconstructed_keys = self._encode_chunk(keys)
+        encoded_values, reconstructed_values = self._encode_chunk(values)
+        self._key_chunks.append(encoded_keys)
+        self._value_chunks.append(encoded_values)
+        self.offset = keys.shape[2]
+        if self.use_dense_shadow:
+            self._ensure_dense_capacity(0, reconstructed_keys, reconstructed_values)
+            self._dense_keys[..., : self.offset, :] = reconstructed_keys
+            self._dense_values[..., : self.offset, :] = reconstructed_values
+
+    @property
+    def dense_nbytes(self) -> int:
+        if self._dense_keys is None:
+            return 0
+        return int(self._dense_keys.nbytes + self._dense_values.nbytes)
 
     @property
     def nbytes(self):
         chunk_bytes = sum(chunk.storage_nbytes for chunk in self._key_chunks + self._value_chunks)
         quantizer_bytes = 0
-        for quantizer in self._quantizers.values():
-            quantizer_bytes += quantizer.rotation.matrix.nbytes
-            quantizer_bytes += quantizer.codebook.centroids.nbytes
-            quantizer_bytes += quantizer.codebook.thresholds.nbytes
+        for numpy_quantizer, _ in self._quantizers.values():
+            quantizer_bytes += numpy_quantizer.rotation.matrix.nbytes
+            quantizer_bytes += numpy_quantizer.codebook.centroids.nbytes
+            quantizer_bytes += numpy_quantizer.codebook.thresholds.nbytes
         return int(chunk_bytes + quantizer_bytes)
 
     @property

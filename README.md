@@ -47,10 +47,10 @@ reports/notes/
 Create the environment and install the package:
 
 ```bash
-/opt/homebrew/bin/python3.12 -m venv ~/Turboquant/.venv
-~/Turboquant/.venv/bin/pip install --upgrade pip setuptools wheel
-~/Turboquant/.venv/bin/pip install mlx-lm
-~/Turboquant/.venv/bin/pip install -e ~/Turboquant --no-build-isolation
+/opt/homebrew/bin/python3.12 -m venv .venv
+.venv/bin/pip install --upgrade pip setuptools wheel
+.venv/bin/pip install mlx-lm
+.venv/bin/pip install -e . --no-build-isolation
 ```
 
 ## Core Validation
@@ -58,19 +58,19 @@ Create the environment and install the package:
 Run the full test suite:
 
 ```bash
-PYTHONPATH=~/Turboquant/src ~/Turboquant/.venv/bin/python -m unittest discover -s ~/Turboquant/tests -v
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 ```
 
 Current local status:
 
-- `11/11` tests passing
+- `18/18` tests passing
 
 ## Synthetic Benchmarks
 
 MSE trend:
 
 ```bash
-PYTHONPATH=~/Turboquant/src ~/Turboquant/.venv/bin/python ~/Turboquant/scripts/run_synthetic_mse_eval.py --dimension 64 --samples 4096 --max-bits 4 --seed 0
+PYTHONPATH=src .venv/bin/python scripts/run_synthetic_mse_eval.py --dimension 64 --samples 4096 --max-bits 4 --seed 0
 ```
 
 Observed output:
@@ -86,7 +86,7 @@ bits    avg_squared_l2_error
 Inner-product bias:
 
 ```bash
-PYTHONPATH=~/Turboquant/src ~/Turboquant/.venv/bin/python ~/Turboquant/scripts/run_inner_product_eval.py --dimension 64 --bits 3 --trials 512 --seed 0
+PYTHONPATH=src .venv/bin/python scripts/run_inner_product_eval.py --dimension 64 --bits 3 --trials 512 --seed 0
 ```
 
 Observed output:
@@ -101,7 +101,7 @@ std=0.050468
 Retrieval benchmark:
 
 ```bash
-PYTHONPATH=~/Turboquant/src ~/Turboquant/.venv/bin/python ~/Turboquant/scripts/run_nn_benchmark.py --dimension 64 --database-size 5000 --query-size 256 --bits 3 --k 10 --seed 0
+PYTHONPATH=src .venv/bin/python scripts/run_nn_benchmark.py --dimension 64 --database-size 5000 --query-size 256 --bits 3 --k 10 --seed 0
 ```
 
 Observed output:
@@ -115,7 +115,7 @@ recall@10=0.517969
 This uses MLX with a cached local model path when available:
 
 ```bash
-~/Turboquant/.venv/bin/python ~/Turboquant/scripts/run_mlx_smoke.py \
+.venv/bin/python scripts/run_mlx_smoke.py \
   --model mlx-community/Llama-3.2-3B-Instruct-4bit \
   --prompt "What is vector quantization?" \
   --max-tokens 64
@@ -126,7 +126,7 @@ This uses MLX with a cached local model path when available:
 Compare baseline generation against TurboQuant-compressed prompt embeddings:
 
 ```bash
-~/Turboquant/.venv/bin/python ~/Turboquant/scripts/run_mlx_turboquant_prompt.py \
+.venv/bin/python scripts/run_mlx_turboquant_prompt.py \
   --model mlx-community/Llama-3.2-3B-Instruct-4bit \
   --bits 3 \
   --prompt "Explain vector quantization in two sentences." \
@@ -146,7 +146,7 @@ baseline and turboquant output: identical on this prompt
 To sweep prompt-level accuracy:
 
 ```bash
-~/Turboquant/.venv/bin/python ~/Turboquant/scripts/eval_mlx_input_embedding_accuracy.py \
+.venv/bin/python scripts/eval_mlx_input_embedding_accuracy.py \
   --model mlx-community/Llama-3.2-3B-Instruct-4bit \
   --bits 1 2 3 4 \
   --seed 0
@@ -171,7 +171,7 @@ the baseline cache.
 Run:
 
 ```bash
-~/Turboquant/.venv/bin/python ~/Turboquant/scripts/eval_mlx_turboquant_kv_memory.py \
+.venv/bin/python scripts/eval_mlx_turboquant_kv_memory.py \
   --model mlx-community/Llama-3.2-3B-Instruct-4bit \
   --bits 3 \
   --repeat 64
@@ -193,4 +193,3 @@ prob_l1=0.0155
 mean_key_cosine=0.9829
 mean_value_cosine=0.9831
 ```
-
