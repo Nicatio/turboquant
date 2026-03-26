@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turboquant"
+version = "0.1.0"
+description = "Reference TurboQuant implementation from arXiv:2504.19874"
+requires-python = ">=3.9"
+dependencies = ["numpy>=2.0"]
+
+[project.optional-dependencies]
+llm = ["mlx-lm>=0.31.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
