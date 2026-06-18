@@ -1,0 +1,5 @@
+mode,implementation,bits,dense_shadow,recent_window,recent_slack,adaptive_tail_layers,adaptive_tail_quant_bits,adaptive_tail_group_size,prompt_tokens,max_tokens,chunk_length,num_chunks,baseline_prefill_tok_s,mode_prefill_tok_s,prefill_ratio,baseline_decode_tok_s,mode_decode_tok_s,decode_ratio,total_compression_ratio,full_attention_compression_ratio,packed_storage_only_ratio,baseline_ppl,mode_ppl,ppl_ratio,ppl_delta,generation_exact_match,logit_top1_match,logit_top5_overlap,prob_l1
+shadow_baseline,shadow,3.0,1,256,8,0,8,64,844,8,256,8,615.92,601.81,0.9771,4.74,4.53,0.9556,1.3098,2.5504,2.7241,6.593280,6.593280,1.000000,0.000000,1,1.0,0.6000,0.0035
+direct_baseline,direct,3.0,0,0,0,0,8,64,844,8,256,8,615.92,550.57,0.8939,4.74,3.87,0.8179,1.4576,5.1792,5.9497,6.593280,6.699097,1.016049,0.105817,1,1.0,0.8000,0.0011
+shadow_adaptive_q8tail,shadow,3.0,1,256,8,2,8,64,844,8,256,8,615.92,549.57,0.8923,4.74,4.14,0.8734,1.3004,2.4616,2.6230,6.593280,6.595546,1.000344,0.002266,1,1.0,0.6000,0.0035
+direct_3_5_adaptive_q8tail,direct,3.5,0,0,0,2,8,64,844,8,256,8,615.92,527.02,0.8557,4.74,3.92,0.8273,1.4112,3.9837,4.1926,6.593280,6.660083,1.010132,0.066803,1,1.0,0.8000,0.0025

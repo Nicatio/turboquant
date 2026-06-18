@@ -45,6 +45,7 @@ scripts/
   eval_mlx_input_embedding_accuracy.py
   eval_mlx_turboquant_kv_memory.py
   eval_mlx_vlm_turboquant_kv.py
+  run_qwen_vlm_turboquant_sweep.py
   run_mlx_needle_benchmark.py
   run_longbench_e_mlx.py
 tests/
@@ -72,7 +73,7 @@ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 
 Current local status:
 
-- `23/23` tests passing
+- `25/25` tests passing
 
 ## Synthetic Benchmarks
 
@@ -248,17 +249,54 @@ Observed local result:
 ```text
 prompt_tokens=844
 baseline_cache_storage_gb=0.053903
-turboquant_cache_storage_gb=0.041701
+turboquant_cache_storage_gb=0.036981
 baseline_linear_state_gb=0.032932
 baseline_full_attention_gb=0.020972
 turboquant_linear_state_gb=0.032932
-turboquant_full_attention_gb=0.008769
+turboquant_full_attention_gb=0.004049
 turboquant_packed_storage_gb=0.003525
-turboquant_quantizer_metadata_gb=0.005244
-storage_compression_ratio=1.2926
-full_attention_compression_ratio=2.3916
+turboquant_quantizer_metadata_gb=0.000524
+storage_compression_ratio=1.4576
+full_attention_compression_ratio=5.1792
 packed_storage_only_ratio=5.9497
 logit_top1_match=1.0000
-prob_l1=0.0036
+prob_l1=0.0011
 generation_exact_match=1
 ```
+
+Important note:
+
+- This benchmark now shares one TurboQuant rotation/codebook across compatible Qwen full-attention layers by default. On this run, that reduced the measured Qwen quantizer metadata from roughly `5.24 MB` to `0.52 MB`.
+- The whole-model ratio is still lower than the Llama benchmark because this model uses `full_attention_interval=4`, so only `10/40` layers use standard full-attention KV caches. The other layers use linear-state caches that are not compressed by the current TurboQuant path.
+- The `packed_storage_only_ratio` is the best indicator of the asymptotic compression on the compressible slice.
+
+## Qwen Long-Context Sweep
+
+This prefill-only sweep shows how the Qwen multimodal compression ratio changes
+as the prompt grows:
+
+```bash
+.venv/bin/python scripts/run_qwen_vlm_turboquant_sweep.py \
+  --model mlx-community/Qwen3.5-35B-A3B-4bit \
+  --image assets/sample_grid.ppm \
+  --bits 3 \
+  --implementation direct \
+  --repeats 1 8 16 32 64 128
+```
+
+Observed local result:
+
+```text
+repeat prompt_tokens total_ratio full_ratio packed_ratio top1 top5 prob_l1
+1      100          1.1270      5.5656     12.5548      1.0000 1.0000 0.0268
+8      268          1.2557      6.3794     9.3683       1.0000 0.6000 0.0048
+16     460          1.2273      4.2879     5.4584       1.0000 0.6000 0.0019
+32     844          1.4576      5.1792     5.9497       1.0000 0.8000 0.0011
+64     1612         1.7326      5.0575     5.4515       1.0000 0.6000 0.0006
+128    3148         2.1692      4.9854     5.1843       1.0000 0.6000 0.0063
+```
+
+Interpretation:
+
+- The whole-model ratio improves with longer prompts because the fixed TurboQuant metadata is amortized while the compressible full-attention cache keeps growing.
+- The full-attention slice is now fairly stable around `5x` on this model at longer contexts.

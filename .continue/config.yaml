@@ -1,0 +1,15 @@
+name: TurboQuant Local Gemma4
+version: 0.0.1
+schema: v1
+
+models:
+  - name: Gemma 4 MLX
+    provider: openai
+    model: gemma4-mlx
+    apiBase: http://127.0.0.1:8000/v1
+    apiKey: local
+    roles:
+      - chat
+      - edit
+      - apply
+      - agent
